@@ -9,8 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spf13/afero"
-
 	"github.com/patrickmn/go-cache"
 
 	apiv1 "kusionstack.io/kusion/pkg/apis/api.kusion.io/v1"
@@ -21,48 +19,41 @@ import (
 	"kusionstack.io/kusion/pkg/log"
 )
 
-var _ runtime.Runtime = &TerraformRuntime{}
+var _ runtime.Runtime = &Runtime{}
 
 // tfEvents is used to record the operation events of the Terraform
 // resources into the related channels for watching.
 var tfEvents = cache.New(cache.NoExpiration, cache.NoExpiration)
 
-type TerraformRuntime struct {
-	tfops.WorkSpace
-	mu *sync.Mutex
+type Runtime struct {
+	mutex   *sync.Mutex
+	context apiv1.GenericConfig
 }
 
-func NewTerraformRuntime(_ *apiv1.Resource) (runtime.Runtime, error) {
-	fs := afero.Afero{Fs: afero.NewOsFs()}
-	ws := tfops.NewWorkSpace(fs)
-	TFRuntime := &TerraformRuntime{
-		WorkSpace: *ws,
-		mu:        &sync.Mutex{},
+func NewTerraformRuntime(spec apiv1.Spec) (runtime.Runtime, error) {
+	TFRuntime := &Runtime{
+		mutex:   &sync.Mutex{},
+		context: spec.Context,
 	}
 	return TFRuntime, nil
 }
 
 // Apply Terraform resource
-func (t *TerraformRuntime) Apply(ctx context.Context, request *runtime.ApplyRequest) *runtime.ApplyResponse {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+func (t *Runtime) Apply(ctx context.Context, request *runtime.ApplyRequest) *runtime.ApplyResponse {
 	plan := request.PlanResource
 	stackPath := request.Stack.Path
 	key := plan.ResourceKey()
 	tfCacheDir := buildTFCacheDir(stackPath, key)
-	t.WorkSpace.SetStackDir(stackPath)
-	t.WorkSpace.SetCacheDir(tfCacheDir)
-	t.WorkSpace.SetResource(plan)
+	ws := tfops.NewWorkSpace(plan, stackPath, tfCacheDir, t.mutex, t.context)
 
-	if err := t.WorkSpace.WriteHCL(); err != nil {
+	if err := ws.WriteHCL(); err != nil {
 		return &runtime.ApplyResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 	}
 
 	_, err := os.Stat(filepath.Join(tfCacheDir, tfops.LockHCLFile))
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := t.WorkSpace.InitWorkSpace(ctx); err != nil {
+			if err := ws.InitWorkSpace(ctx); err != nil {
 				return &runtime.ApplyResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 			}
 		} else {
@@ -72,7 +63,28 @@ func (t *TerraformRuntime) Apply(ctx context.Context, request *runtime.ApplyRequ
 
 	// dry run by terraform plan
 	if request.DryRun {
-		pr, err := t.WorkSpace.Plan(ctx)
+		// the import resource should be import and return the resource from tfstate
+		if _, ok := plan.Extensions[tfops.ImportIDKey].(string); ok {
+			readResponse := t.Read(ctx, &runtime.ReadRequest{
+				PriorResource: request.PriorResource,
+				PlanResource:  request.PlanResource,
+				Stack:         request.Stack,
+			})
+			if readResponse.Status != nil {
+				return &runtime.ApplyResponse{Resource: &apiv1.Resource{}, Status: readResponse.Status}
+			}
+			return &runtime.ApplyResponse{
+				Resource: &apiv1.Resource{
+					ID:         plan.ID,
+					Type:       plan.Type,
+					Attributes: readResponse.Resource.Attributes,
+					DependsOn:  plan.DependsOn,
+					Extensions: plan.Extensions,
+				},
+				Status: nil,
+			}
+		}
+		pr, err := ws.Plan(ctx)
 		if err != nil {
 			return &runtime.ApplyResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 		}
@@ -105,12 +117,12 @@ func (t *TerraformRuntime) Apply(ctx context.Context, request *runtime.ApplyRequ
 
 		// Start applying the resource.
 		go func() {
-			tfstate, err = t.WorkSpace.Apply(ctx)
+			tfstate, err = ws.Apply(ctx)
 			if err != nil {
 				errCh <- err
 			}
 
-			providerAddr, err = t.WorkSpace.GetProvider()
+			providerAddr, err = ws.GetProvider()
 			errCh <- err
 		}()
 
@@ -145,13 +157,13 @@ func (t *TerraformRuntime) Apply(ctx context.Context, request *runtime.ApplyRequ
 		}
 	} else {
 		// Apply without watching.
-		tfstate, err = t.WorkSpace.Apply(ctx)
+		tfstate, err = ws.Apply(ctx)
 		if err != nil {
 			return &runtime.ApplyResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 		}
 
 		// get terraform provider version
-		providerAddr, err = t.WorkSpace.GetProvider()
+		providerAddr, err = ws.GetProvider()
 		if err != nil {
 			return &runtime.ApplyResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 		}
@@ -177,7 +189,7 @@ func buildTFCacheDir(stackPath string, key string) string {
 }
 
 // Read terraform show state
-func (t *TerraformRuntime) Read(ctx context.Context, request *runtime.ReadRequest) *runtime.ReadResponse {
+func (t *Runtime) Read(ctx context.Context, request *runtime.ReadRequest) *runtime.ReadResponse {
 	priorResource := request.PriorResource
 	planResource := request.PlanResource
 
@@ -199,30 +211,20 @@ func (t *TerraformRuntime) Read(ctx context.Context, request *runtime.ReadReques
 			DependsOn:  priorResource.DependsOn,
 			Extensions: priorResource.Extensions,
 		}
-
-		// For the resource to be deleted, the 'import_id' attribute in 'Extensions' field should be removed.
-		if _, ok := planResource.Extensions[tfops.ImportIDKey].(string); ok {
-			delete(planResource.Extensions, tfops.ImportIDKey)
-		}
 	}
 
-	var tfstate *tfops.StateRepresentation
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	var tfState *tfops.StateRepresentation
 	stackPath := request.Stack.Path
 	tfCacheDir := buildTFCacheDir(stackPath, planResource.ResourceKey())
-	t.WorkSpace.SetStackDir(stackPath)
-	t.WorkSpace.SetCacheDir(tfCacheDir)
-	t.WorkSpace.SetResource(planResource)
 
-	if err := t.WorkSpace.WriteHCL(); err != nil {
+	ws := tfops.NewWorkSpace(planResource, stackPath, tfCacheDir, t.mutex, t.context)
+	if err := ws.WriteHCL(); err != nil {
 		return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 	}
 	_, err := os.Stat(filepath.Join(tfCacheDir, tfops.LockHCLFile))
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := t.WorkSpace.InitWorkSpace(ctx); err != nil {
+			if err := ws.InitWorkSpace(ctx); err != nil {
 				return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 			}
 		} else {
@@ -230,38 +232,55 @@ func (t *TerraformRuntime) Read(ctx context.Context, request *runtime.ReadReques
 		}
 	}
 
-	if priorResource == nil {
-		// For resources declared with 'import_id' in the 'Extensions' field,
-		// use 'terraform import' to import the latest state.
-		importID, ok := planResource.Extensions[tfops.ImportIDKey].(string)
-		if ok && importID != "" {
-			if err = t.WorkSpace.ImportResource(ctx, importID); err != nil {
+	importID, ok := planResource.Extensions[tfops.ImportIDKey].(string)
+	if ok && importID != "" {
+		if err = ws.ImportResource(ctx, importID); err != nil {
+			return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
+		} else {
+			// read resource from tfstate
+			tfState, err = ws.ShowState(ctx)
+			if err != nil {
 				return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 			}
-		} else {
-			return &runtime.ReadResponse{Resource: nil, Status: nil}
+			// get terraform provider version
+			providerAddr, err := ws.GetProvider()
+			if err != nil {
+				return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
+			}
+			r := tfops.ConvertTFState(tfState, providerAddr)
+			return &runtime.ReadResponse{
+				Resource: &apiv1.Resource{
+					ID:         planResource.ID,
+					Type:       planResource.Type,
+					Attributes: r.Attributes,
+					DependsOn:  planResource.DependsOn,
+					Extensions: planResource.Extensions,
+				}, Status: nil,
+			}
 		}
-	} else if err = t.WorkSpace.WriteTFState(priorResource); err != nil {
-		// priorResource overwrite tfstate in workspace
+	} else if priorResource == nil {
+		return &runtime.ReadResponse{Resource: nil, Status: nil}
+	} else if err = ws.WriteTFState(priorResource); err != nil {
+		// priorResource overwrite tfState in workspace
 		return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 	}
 
-	tfstate, err = t.WorkSpace.RefreshOnly(ctx)
+	tfState, err = ws.RefreshOnly(ctx)
 	if err != nil {
 		return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 	}
 
-	if tfstate == nil || tfstate.Values == nil {
+	if tfState == nil || tfState.Values == nil {
 		return &runtime.ReadResponse{Resource: nil, Status: nil}
 	}
 
 	// get terraform provider addr
-	providerAddr, err := t.WorkSpace.GetProvider()
+	providerAddr, err := ws.GetProvider()
 	if err != nil {
 		return &runtime.ReadResponse{Resource: nil, Status: v1.NewErrorStatus(err)}
 	}
 
-	r := tfops.ConvertTFState(tfstate, providerAddr)
+	r := tfops.ConvertTFState(tfState, providerAddr)
 	return &runtime.ReadResponse{
 		Resource: &apiv1.Resource{
 			ID:         planResource.ID,
@@ -274,7 +293,7 @@ func (t *TerraformRuntime) Read(ctx context.Context, request *runtime.ReadReques
 	}
 }
 
-func (t *TerraformRuntime) Import(ctx context.Context, request *runtime.ImportRequest) *runtime.ImportResponse {
+func (t *Runtime) Import(ctx context.Context, request *runtime.ImportRequest) *runtime.ImportResponse {
 	response := t.Read(ctx, &runtime.ReadRequest{
 		PlanResource: request.PlanResource,
 		Stack:        request.Stack,
@@ -294,16 +313,12 @@ func (t *TerraformRuntime) Import(ctx context.Context, request *runtime.ImportRe
 }
 
 // Delete terraform resource and remove workspace
-func (t *TerraformRuntime) Delete(ctx context.Context, request *runtime.DeleteRequest) (res *runtime.DeleteResponse) {
+func (t *Runtime) Delete(ctx context.Context, request *runtime.DeleteRequest) (res *runtime.DeleteResponse) {
 	stackPath := request.Stack.Path
 	tfCacheDir := buildTFCacheDir(stackPath, request.Resource.ResourceKey())
-	t.mu.Lock()
-	defer t.mu.Unlock()
 
-	t.WorkSpace.SetStackDir(stackPath)
-	t.WorkSpace.SetCacheDir(tfCacheDir)
-	t.WorkSpace.SetResource(request.Resource)
-	if err := t.WorkSpace.Destroy(ctx); err != nil {
+	ws := tfops.NewWorkSpace(request.Resource, stackPath, tfCacheDir, t.mutex, t.context)
+	if err := ws.Destroy(ctx); err != nil {
 		return &runtime.DeleteResponse{Status: v1.NewErrorStatus(err)}
 	}
 
@@ -316,7 +331,7 @@ func (t *TerraformRuntime) Delete(ctx context.Context, request *runtime.DeleteRe
 }
 
 // Watch terraform resource
-func (t *TerraformRuntime) Watch(ctx context.Context, request *runtime.WatchRequest) *runtime.WatchResponse {
+func (t *Runtime) Watch(ctx context.Context, request *runtime.WatchRequest) *runtime.WatchResponse {
 	// Get the event channel.
 	id := request.Resource.ResourceKey()
 	eventCh, ok := tfEvents.Get(id)

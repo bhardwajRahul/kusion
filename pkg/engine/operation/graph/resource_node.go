@@ -17,6 +17,7 @@ import (
 	"kusionstack.io/kusion/pkg/engine"
 	"kusionstack.io/kusion/pkg/engine/operation/models"
 	"kusionstack.io/kusion/pkg/engine/runtime"
+	"kusionstack.io/kusion/pkg/engine/runtime/terraform/tfops"
 	"kusionstack.io/kusion/pkg/log"
 	"kusionstack.io/kusion/pkg/secrets"
 	"kusionstack.io/kusion/pkg/util"
@@ -106,7 +107,7 @@ func (rn *ResourceNode) replaceK8sSecretRefs(o *models.Operation) v1.Status {
 			continue
 		}
 
-		externalSecretRef, err := parseExternalSecretDataRef(ref)
+		externalSecretRef, err := ParseExternalSecretDataRef(ref)
 		if err != nil {
 			return v1.NewErrorStatus(err)
 		}
@@ -156,13 +157,13 @@ func (rn *ResourceNode) Execute(operation *models.Operation) (s v1.Status) {
 		}
 	}()
 
-	if s = rn.PreExecute(operation); v1.IsErr(s) {
-		return s
-	}
-
 	// init 3-way diff data
 	planedResource, priorResource, liveResource, s := rn.initThreeWayDiffData(operation)
 	if v1.IsErr(s) {
+		return s
+	}
+
+	if s = rn.PreExecute(operation); v1.IsErr(s) {
 		return s
 	}
 
@@ -204,6 +205,12 @@ func (rn *ResourceNode) computeActionType(
 	switch operation.OperationType {
 	case models.Destroy, models.DestroyPreview:
 		rn.Action = models.Delete
+		if planedResource != nil {
+			importID, ok := planedResource.Extensions[tfops.ImportIDKey].(string)
+			if ok && importID != "" {
+				rn.Action = models.UnChanged
+			}
+		}
 	case models.Apply, models.ApplyPreview:
 		if planedResource == nil {
 			rn.Action = models.Delete
@@ -251,7 +258,9 @@ func (rn *ResourceNode) initThreeWayDiffData(operation *models.Operation) (*apiv
 	// When a resource is deleted in Intent but exists in PriorState,
 	// this node should be regarded as a deleted node, and rn.resource stores the PriorState
 	if rn.Action == models.Delete {
-		planedResource = nil
+		if _, ok := planedResource.Extensions[tfops.ImportIDKey].(string); !ok {
+			planedResource = nil
+		}
 	}
 
 	// 2. get prior resource from the latest release
@@ -271,6 +280,16 @@ func (rn *ResourceNode) initThreeWayDiffData(operation *models.Operation) (*apiv
 	if v1.IsErr(s) {
 		return nil, nil, nil, s
 	}
+
+	// Set the priorResource as the liveResource if the planedResource is an imported resource.
+	// In this way, the implicit dependencies can be correctly replaced.
+	if planedResource != nil {
+		if _, ok := planedResource.Extensions[tfops.ImportIDKey]; ok && priorResource == nil {
+			priorResource = liveResource
+			operation.PriorStateResourceIndex[key] = priorResource
+		}
+	}
+
 	return planedResource, priorResource, liveResource, nil
 }
 
@@ -513,8 +532,8 @@ func ReplaceRef(
 	return result, v, nil
 }
 
-// parseExternalSecretDataRef knows how to parse the remote data ref string, returns the corresponding ExternalSecretRef object.
-func parseExternalSecretDataRef(dataRefStr string) (*apiv1.ExternalSecretRef, error) {
+// ParseExternalSecretDataRef knows how to parse the remote data ref string, returns the corresponding ExternalSecretRef object.
+func ParseExternalSecretDataRef(dataRefStr string) (*apiv1.ExternalSecretRef, error) {
 	uri, err := url.Parse(dataRefStr)
 	if err != nil {
 		return nil, err

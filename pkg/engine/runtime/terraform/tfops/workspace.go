@@ -10,17 +10,18 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
-	"github.com/spf13/afero"
 
 	v1 "kusionstack.io/kusion/pkg/apis/api.kusion.io/v1"
 	"kusionstack.io/kusion/pkg/log"
 	"kusionstack.io/kusion/pkg/util/io"
 	jsonutil "kusionstack.io/kusion/pkg/util/json"
 	"kusionstack.io/kusion/pkg/util/kfile"
+	"kusionstack.io/kusion/pkg/workspace"
 )
 
 const (
@@ -28,36 +29,45 @@ const (
 )
 
 const (
-	envLog            = "TF_LOG"
-	envPluginCacheDir = "TF_PLUGIN_CACHE_DIR"
-	tfDebugLOG        = "DEBUG"
-	envLogPath        = "TF_LOG_PATH"
-	LockHCLFile       = ".terraform.lock.hcl"
-	mainTFFile        = "main.tf.json"
-	tfPlanFile        = "plan.out"
-	tfStateFile       = "terraform.tfstate"
-	tfProviderPrefix  = "terraform-provider"
-	terraformD        = ".terraform.d"
-	pluginCache       = "plugin-cache"
+	envLog = "TF_LOG"
+	// According to this issue(https://github.com/hashicorp/terraform/issues/35345),
+	// the description of `TF_PLUGIN_CACHE_DIR` is out of date and won't work as we expected.
+	// we have to set TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE to ignore the dependency lock file to reuse the plugin cache.
+	envBreakDependencyLockFile = "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"
+	envPluginCacheDir          = "TF_PLUGIN_CACHE_DIR"
+	tfDebugLOG                 = "DEBUG"
+	envLogPath                 = "TF_LOG_PATH"
+	LockHCLFile                = ".terraform.lock.hcl"
+	mainTFFile                 = "main.tf.json"
+	tfPlanFile                 = "plan.out"
+	tfStateFile                = "terraform.tfstate"
+	tfProviderPrefix           = "terraform-provider"
+	terraformD                 = ".terraform.d"
+	pluginCache                = "plugin-cache"
 )
 
-var envTFLog = fmt.Sprintf("%s=%s", envLog, tfDebugLOG)
+var (
+	envTFLog                              = fmt.Sprintf("%s=%s", envLog, tfDebugLOG)
+	envPluginCacheBreakDependencyLockFile = fmt.Sprintf("%s=%s", envBreakDependencyLockFile, "true")
+)
 
 type WorkSpace struct {
 	resource   *v1.Resource
-	fs         afero.Afero
 	stackDir   string
 	tfCacheDir string
+	// mutex passed from TF runtime
+	mutex *sync.Mutex
+	// context passed from TF runtime.
+	context v1.GenericConfig
+}
+
+func NewWorkSpace(resource *v1.Resource, stackDir string, tfCacheDir string, mutex *sync.Mutex, context v1.GenericConfig) *WorkSpace {
+	return &WorkSpace{resource: resource, stackDir: stackDir, tfCacheDir: tfCacheDir, mutex: mutex, context: context}
 }
 
 // SetResource set workspace resource
 func (w *WorkSpace) SetResource(resource *v1.Resource) {
 	w.resource = resource
-}
-
-// SetFS set filesystem
-func (w *WorkSpace) SetFS(fs afero.Afero) {
-	w.fs = fs
 }
 
 // SetStackDir set workspace work directory.
@@ -68,12 +78,6 @@ func (w *WorkSpace) SetStackDir(stackDir string) {
 // SetCacheDir set tf cache work directory.
 func (w *WorkSpace) SetCacheDir(cacheDir string) {
 	w.tfCacheDir = cacheDir
-}
-
-func NewWorkSpace(fs afero.Afero) *WorkSpace {
-	return &WorkSpace{
-		fs: fs,
-	}
 }
 
 // WriteHCL convert kusion Resource to HCL json
@@ -115,17 +119,17 @@ func (w *WorkSpace) WriteHCL() error {
 
 	hclMain := jsonutil.Marshal2PrettyString(m)
 
-	_, err := w.fs.Stat(w.tfCacheDir)
+	_, err := os.Stat(w.tfCacheDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := w.fs.MkdirAll(w.tfCacheDir, os.ModePerm); err != nil {
+			if err := os.MkdirAll(w.tfCacheDir, os.ModePerm); err != nil {
 				return fmt.Errorf("create workspace error: %v", err)
 			}
 		} else {
 			return err
 		}
 	}
-	err = w.fs.WriteFile(filepath.Join(w.tfCacheDir, mainTFFile), []byte(hclMain), 0o600)
+	err = os.WriteFile(filepath.Join(w.tfCacheDir, mainTFFile), []byte(hclMain), 0o600)
 	if err != nil {
 		return fmt.Errorf("write hcl main.tf.json error: %v", err)
 	}
@@ -178,7 +182,7 @@ func (w *WorkSpace) WriteTFState(priorState *v1.Resource) error {
 	}
 	hclState := jsonutil.Marshal2PrettyString(m)
 
-	err := w.fs.WriteFile(filepath.Join(w.tfCacheDir, tfStateFile), []byte(hclState), os.ModePerm)
+	err := os.WriteFile(filepath.Join(w.tfCacheDir, tfStateFile), []byte(hclState), os.ModePerm)
 	if err != nil {
 		return fmt.Errorf("write hcl error: %v", err)
 	}
@@ -193,7 +197,7 @@ func (w *WorkSpace) ClearTFState() error {
 	}
 	hclState := jsonutil.Marshal2PrettyString(m)
 
-	err := w.fs.WriteFile(filepath.Join(w.tfCacheDir, tfStateFile), []byte(hclState), os.ModePerm)
+	err := os.WriteFile(filepath.Join(w.tfCacheDir, tfStateFile), []byte(hclState), os.ModePerm)
 	if err != nil {
 		return fmt.Errorf("write hcl error: %v", err)
 	}
@@ -204,6 +208,14 @@ func (w *WorkSpace) ClearTFState() error {
 // InitWorkSpace init terraform runtime workspace
 func (w *WorkSpace) InitWorkSpace(ctx context.Context) error {
 	chdir := fmt.Sprintf("-chdir=%s", w.tfCacheDir)
+
+	// We use TF_PLUGIN_CACHE_DIR to enable caching or to override an existing cache directory within a particular shell session
+	// but the plugin cache directory is not guaranteed to be concurrency safe.
+	// The provider installer's behavior in environments with multiple terraform init calls is undefined.
+	// So we need to lock the `terraform init` command to ensure that only one terraform init call can access the provider cache directory
+	// at a time.
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
 	cmd := exec.CommandContext(ctx, "terraform", chdir, "init")
 	cmd.Dir = w.stackDir
 	envs, err := w.initEnvs()
@@ -212,13 +224,18 @@ func (w *WorkSpace) InitWorkSpace(ctx context.Context) error {
 	}
 	cmd.Env = envs
 	_, err = cmd.Output()
-	if e, ok := err.(*exec.ExitError); ok {
+	var e *exec.ExitError
+	if errors.As(err, &e) {
 		return errors.New(string(e.Stderr))
 	}
 	return nil
 }
 
 func (w *WorkSpace) initEnvs() ([]string, error) {
+	providerInfoEnvs, err := w.getEnvProviderInfo()
+	if err != nil {
+		return nil, err
+	}
 	providerCachePath, err := getProviderCachePath()
 	if err != nil {
 		return nil, err
@@ -227,7 +244,7 @@ func (w *WorkSpace) initEnvs() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := append(os.Environ(), envTFLog, providerCachePath, logPath)
+	result := append(append(os.Environ(), providerInfoEnvs...), envTFLog, envPluginCacheBreakDependencyLockFile, providerCachePath, logPath)
 	return result, nil
 }
 
@@ -239,7 +256,7 @@ func (w *WorkSpace) Apply(ctx context.Context) (*StateRepresentation, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, "terraform", chdir, "apply", "-auto-approve", "-json", "-lock=false")
+	cmd := exec.CommandContext(ctx, "terraform", chdir, "apply", "-auto-approve", "-json")
 	cmd.Dir = w.stackDir
 	envs, err := w.initEnvs()
 	if err != nil {
@@ -296,7 +313,7 @@ func (w *WorkSpace) Import(ctx context.Context, to, id string) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, "terraform", chdir, "import", "-lock=false", to, id)
+	cmd := exec.CommandContext(ctx, "terraform", chdir, "import", to, id)
 	cmd.Dir = w.stackDir
 	envs, err := w.initEnvs()
 	if err != nil {
@@ -314,7 +331,7 @@ func (w *WorkSpace) Import(ctx context.Context, to, id string) error {
 
 // ShowState shows local tfstate with the terraform cli show command
 func (w *WorkSpace) ShowState(ctx context.Context) (*StateRepresentation, error) {
-	fi, err := w.fs.Stat(filepath.Join(w.tfCacheDir, tfStateFile))
+	fi, err := os.Stat(filepath.Join(w.tfCacheDir, tfStateFile))
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -335,7 +352,7 @@ func (w *WorkSpace) ShowState(ctx context.Context) (*StateRepresentation, error)
 
 // ShowPlan shows local plan file with the terraform cli show command
 func (w *WorkSpace) ShowPlan(ctx context.Context) (*PlanRepresentation, error) {
-	fi, err := w.fs.Stat(filepath.Join(w.tfCacheDir, tfPlanFile))
+	fi, err := os.Stat(filepath.Join(w.tfCacheDir, tfPlanFile))
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -372,7 +389,7 @@ func (w *WorkSpace) RefreshOnly(ctx context.Context) (*StateRepresentation, erro
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "terraform", chdir, "apply", "-auto-approve", "-json", "--refresh-only", "-lock=false")
+	cmd := exec.CommandContext(ctx, "terraform", chdir, "apply", "-auto-approve", "-json", "--refresh-only")
 	cmd.Dir = w.stackDir
 
 	envs, err := w.initEnvs()
@@ -501,6 +518,89 @@ func (w *WorkSpace) getEnvProviderLogPath() (string, error) {
 	providerLogPath := filepath.Join(kusionDataDir, "logs", fmt.Sprintf("%s-%s.log", tfProviderPrefix, provider[len(provider)-2]))
 	envTFLogPath := fmt.Sprintf("%s=%s", envLogPath, providerLogPath)
 	return envTFLogPath, nil
+}
+
+// getEnvProviderInfo returns the provider credential and region environment
+// variables, the environment variables are parsed from context.
+func (w *WorkSpace) getEnvProviderInfo() ([]string, error) {
+	var envs []string
+	context := w.context
+
+	// Get AWS provider AK/SK and region.
+	awsAccessKeyID, err := workspace.GetStringFromGenericConfig(context, v1.EnvAwsAccessKeyID)
+	if err != nil {
+		return nil, err
+	}
+	if awsAccessKeyID != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAwsAccessKeyID, awsAccessKeyID))
+	}
+
+	awsSecretAccessKey, err := workspace.GetStringFromGenericConfig(context, v1.EnvAwsSecretAccessKey)
+	if err != nil {
+		return nil, err
+	}
+	if awsSecretAccessKey != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAwsSecretAccessKey, awsSecretAccessKey))
+	}
+
+	awsRegion, err := workspace.GetStringFromGenericConfig(context, v1.EnvAwsRegion)
+	if err != nil {
+		return nil, err
+	}
+	if awsRegion != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAwsRegion, awsRegion))
+	}
+
+	// Get Alicloud provider AK/SK and region.
+	alicloudAccessKey, err := workspace.GetStringFromGenericConfig(context, v1.EnvAlicloudAccessKey)
+	if err != nil {
+		return nil, err
+	}
+	if alicloudAccessKey != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAlicloudAccessKey, alicloudAccessKey))
+	}
+
+	alicloudSecretKey, err := workspace.GetStringFromGenericConfig(context, v1.EnvAlicloudSecretKey)
+	if err != nil {
+		return nil, err
+	}
+	if alicloudSecretKey != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAlicloudSecretKey, alicloudSecretKey))
+	}
+
+	alicloudRegion, err := workspace.GetStringFromGenericConfig(context, v1.EnvAlicloudRegion)
+	if err != nil {
+		return nil, err
+	}
+	if alicloudRegion != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvAlicloudRegion, alicloudRegion))
+	}
+
+	viettelCloudCmpURL, err := workspace.GetStringFromGenericConfig(context, v1.EnvViettelCloudCmpURL)
+	if err != nil {
+		return nil, err
+	}
+	if viettelCloudCmpURL != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvViettelCloudCmpURL, viettelCloudCmpURL))
+	}
+
+	viettelCloudUserToken, err := workspace.GetStringFromGenericConfig(context, v1.EnvViettelCloudUserToken)
+	if err != nil {
+		return nil, err
+	}
+	if viettelCloudUserToken != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvViettelCloudUserToken, viettelCloudUserToken))
+	}
+
+	viettelCloudProjectID, err := workspace.GetStringFromGenericConfig(context, v1.EnvViettelCloudProjectID)
+	if err != nil {
+		return nil, err
+	}
+	if viettelCloudProjectID != "" {
+		envs = append(envs, fmt.Sprintf("%s=%s", v1.EnvViettelCloudProjectID, viettelCloudProjectID))
+	}
+
+	return envs, nil
 }
 
 func getProviderCachePath() (string, error) {

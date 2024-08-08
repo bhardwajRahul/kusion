@@ -15,6 +15,11 @@ const (
 	RecommendedKubeConfigFileName = "config"
 )
 
+const (
+	KubeConfigPathKey    = "KUBECONFIG_PATH"
+	KubeConfigContentKey = "KUBECONFIG_CONTENT"
+)
+
 var (
 	RecommendedConfigDir      = filepath.Join(homedir.HomeDir(), RecommendedHomeDir)
 	RecommendedKubeConfigFile = filepath.Join(RecommendedConfigDir, RecommendedKubeConfigFileName)
